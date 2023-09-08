@@ -17,10 +17,11 @@ use base64::{engine::general_purpose::STANDARD as Base64, Engine};
 use bytes::Bytes;
 use http::{header::HeaderName, uri::PathAndQuery, HeaderValue, Method, Uri};
 use http_signature_normalization_reqwest::prelude::{Config, SignExt};
-use once_cell::sync::Lazy;
+use lru::LruCache;
+use once_cell::sync::{Lazy, OnceCell};
 use openssl::{
     hash::MessageDigest,
-    pkey::{PKey, Private},
+    pkey::{PKey, Private, Public},
     rsa::Rsa,
     sign::{Signer, Verifier},
 };
@@ -28,7 +29,7 @@ use reqwest::Request;
 use reqwest_middleware::RequestBuilder;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fmt::Debug, io::ErrorKind, time::Duration};
+use std::{collections::BTreeMap, fmt::Debug, io::ErrorKind, time::Duration, num::NonZeroUsize, sync::Mutex};
 use tracing::debug;
 use url::Url;
 
@@ -182,6 +183,8 @@ where
     Ok(actor)
 }
 
+static SIGNATURE_CACHE: OnceCell<Mutex<LruCache<Vec<u8>, PKey<Public>>>> = OnceCell::new();
+
 /// Verifies that the signature present in the request is valid for
 /// the specified actor's public key.
 fn verify_signature_inner(
@@ -203,8 +206,16 @@ fn verify_signature_inner(
                 "Verifying with key {}, message {}",
                 &public_key, &signing_string
             );
-            let public_key = PKey::public_key_from_pem(public_key.as_bytes())?;
-            let mut verifier = Verifier::new(MessageDigest::sha256(), &public_key)?;
+
+            let mut signature_cache = SIGNATURE_CACHE.get_or_init(|| {
+                Mutex::new(LruCache::new(NonZeroUsize::new(1024).unwrap()))
+            }).lock().unwrap();
+
+            let public_key = signature_cache.try_get_or_insert(public_key.as_bytes().to_owned(), || {
+                PKey::public_key_from_pem(public_key.as_bytes())
+            })?;
+
+            let mut verifier = Verifier::new(MessageDigest::sha256(), public_key)?;
             verifier.update(signing_string.as_bytes())?;
             Ok(verifier.verify(&Base64.decode(signature)?)?)
         })
